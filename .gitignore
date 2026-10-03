@@ -1,0 +1,13 @@
+# Artefacte de build si dependente. Repository-ul contine sursele, nu rezultatele.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage/
+
+# Secrete. Nu comiteti niciodata credentiale.
+.env
+*.pem
+*.key

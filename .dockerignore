@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+README.md
+docs/
+tests/
+coverage/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+Dockerfile
+.dockerignore
+map.json
