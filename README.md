@@ -22,6 +22,7 @@ Python 3.13 cu Flask
 ```
 docker build -t map-proiect .
 docker run -d -p 8080:8080 map-proiect
+
 ```
 
 Aplicatia asculta pe portul 8080. Verificati:
