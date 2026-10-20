@@ -1,3 +1,4 @@
+[![CI](https://github.com/alexdeliu/map-proiect/actions/workflows/ci.yml/badge.svg)](https://github.com/alexdeliu/map-proiect/actions/workflows/ci.yml)
 # Gestiune de inventar
 
 Proiect individual la disciplina Metode avansate de programare, anul universitar 2026-2027.
