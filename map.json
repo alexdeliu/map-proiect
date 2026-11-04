@@ -6,5 +6,8 @@
   "email": "alexandru-darius.deliu@student.upt.ro",
   "tema": 4,
   "limbaj": "python",
-  "extensii": []
+  "extensii": [
+    "R2",
+    "admin"
+  ]
 }

@@ -1,12 +1,19 @@
 """Inventory management web service for the MAP individual project.
 
-Implements the common HTTP contract (/health, /version, /, /reset)
-and Theme 4 routes (/products, /movements, /stats).
+Implements the common HTTP contract (/health, /version, /, /reset),
+Theme 4 routes (/products, /movements, /stats), and optional extensions
+(Cloudflare R2 S3-compatible persistence and protected /admin/stats route).
 """
 
+import json
 import os
+import secrets
 import time
 from typing import Any
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request
 
 APP_NAME = "map-project"
@@ -16,6 +23,7 @@ STARTED_AT = time.monotonic()
 # Theme 4 specific parameter: default minimum stock threshold (P = 15)
 DEFAULT_MIN_THRESHOLD = 15
 MAX_CODE_LENGTH = 20
+S3_STATE_KEY = "inventory_state.json"
 
 app = Flask(__name__)
 
@@ -31,21 +39,93 @@ def error_response(error_code: str, message: str, status_code: int):
 
 
 class Store:
-    """Holds the application data in memory.
+    """Holds the application data in memory with optional S3/R2 persistence.
 
-    Everything is lost when the container restarts.
     Current stock is never stored directly; it is dynamically calculated
     from initial_stock plus 'in' movements minus 'out' movements.
     """
 
     def __init__(self) -> None:
-        self.reset()
+        self._init_memory()
+        self.load_from_s3()
 
-    def reset(self) -> None:
+    def _init_memory(self) -> None:
         self.next_id = 1
         self.next_movement_id = 1
         self.products: dict[int, dict[str, Any]] = {}
         self.movements: list[dict[str, Any]] = []
+
+    def _get_s3_config(self) -> dict[str, str] | None:
+        """Read S3 configuration from environment variables if all are present."""
+        endpoint = os.getenv("S3_ENDPOINT")
+        bucket = os.getenv("S3_BUCKET")
+        access_key = os.getenv("S3_ACCESS_KEY")
+        secret_key = os.getenv("S3_SECRET_KEY")
+        if endpoint and bucket and access_key and secret_key:
+            return {
+                "endpoint": endpoint,
+                "bucket": bucket,
+                "access_key": access_key,
+                "secret_key": secret_key,
+            }
+        return None
+
+    def _create_s3_client(self, cfg: dict[str, str]):
+        """Create an S3-compatible client configured for Cloudflare R2 / S3."""
+        return boto3.client(
+            "s3",
+            endpoint_url=cfg["endpoint"],
+            aws_access_key_id=cfg["access_key"],
+            aws_secret_access_key=cfg["secret_key"],
+            region_name="auto",
+            config=Config(signature_version="s3v4"),
+        )
+
+    def save_to_s3(self) -> None:
+        """Persist current state as JSON in the S3/R2 bucket if configured."""
+        cfg = self._get_s3_config()
+        if not cfg:
+            return
+        payload = {
+            "next_id": self.next_id,
+            "next_movement_id": self.next_movement_id,
+            "products": self.products,
+            "movements": self.movements,
+        }
+        try:
+            client = self._create_s3_client(cfg)
+            client.put_object(
+                Bucket=cfg["bucket"],
+                Key=S3_STATE_KEY,
+                Body=json.dumps(payload).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except (BotoCoreError, ClientError, Exception):
+            pass
+
+    def load_from_s3(self) -> None:
+        """Load persisted state from the S3/R2 bucket on startup if available."""
+        cfg = self._get_s3_config()
+        if not cfg:
+            return
+        try:
+            client = self._create_s3_client(cfg)
+            response = client.get_object(Bucket=cfg["bucket"], Key=S3_STATE_KEY)
+            raw_body = response["Body"].read().decode("utf-8")
+            data = json.loads(raw_body)
+            self.next_id = int(data.get("next_id", 1))
+            self.next_movement_id = int(data.get("next_movement_id", 1))
+            self.products = {
+                int(k): v for k, v in data.get("products", {}).items()
+            }
+            self.movements = list(data.get("movements", []))
+        except (BotoCoreError, ClientError, Exception):
+            pass
+
+    def reset(self) -> None:
+        """Clear all data in memory and sync empty state to S3 if configured."""
+        self._init_memory()
+        self.save_to_s3()
 
     def calculate_current_stock(self, product_id: int) -> int:
         """Compute current stock dynamically from initial stock and movements."""
@@ -69,6 +149,20 @@ class Store:
             "initial_stock": product["initial_stock"],
             "min_threshold": product["min_threshold"],
             "current_stock": self.calculate_current_stock(product_id),
+        }
+
+    def compute_stats(self) -> dict[str, int]:
+        """Compute global inventory statistics."""
+        serialized_products = [self.serialize_product(pid) for pid in self.products]
+        total_products = len(serialized_products)
+        below_threshold = sum(
+            1 for p in serialized_products if p["current_stock"] < p["min_threshold"]
+        )
+        total_stock = sum(p["current_stock"] for p in serialized_products)
+        return {
+            "total_products": total_products,
+            "below_threshold": below_threshold,
+            "total_stock": total_stock,
         }
 
 
@@ -172,6 +266,7 @@ def create_product():
         "initial_stock": initial_stock,
         "min_threshold": min_threshold,
     }
+    store.save_to_s3()
 
     return jsonify(store.serialize_product(product_id)), 201
 
@@ -248,25 +343,36 @@ def create_movement():
         "quantity": quantity,
     }
     store.movements.append(movement)
+    store.save_to_s3()
 
     return jsonify(movement), 201
 
 
 @app.get("/stats")
 def get_stats():
-    serialized_products = [store.serialize_product(pid) for pid in store.products]
+    return jsonify(store.compute_stats()), 200
 
-    total_products = len(serialized_products)
-    below_threshold = sum(
-        1 for p in serialized_products if p["current_stock"] < p["min_threshold"]
-    )
-    total_stock = sum(p["current_stock"] for p in serialized_products)
 
-    return jsonify(
-        total_products=total_products,
-        below_threshold=below_threshold,
-        total_stock=total_stock,
-    ), 200
+# --- Optional Extension: Protected Administrative Route ---
+
+@app.get("/admin/stats")
+def admin_stats():
+    admin_user = os.getenv("ADMIN_USER")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+
+    if not admin_user or not admin_password:
+        return error_response("unauthorized", "Admin credentials are not configured", 401)
+
+    auth = request.authorization
+    if (
+        auth is None
+        or auth.type != "basic"
+        or not secrets.compare_digest(auth.username or "", admin_user)
+        or not secrets.compare_digest(auth.password or "", admin_password)
+    ):
+        return error_response("unauthorized", "Invalid or missing credentials", 401)
+
+    return jsonify(store.compute_stats()), 200
 
 
 @app.errorhandler(404)

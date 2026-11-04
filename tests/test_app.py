@@ -1,3 +1,6 @@
+import base64
+import io
+import json
 import pytest
 
 from src.app import APP_NAME, app, store
@@ -13,6 +16,11 @@ def client():
     app.config["TESTING"] = True
     with app.test_client() as test_client:
         yield test_client
+
+
+def _basic_auth_header(username: str, password: str) -> dict[str, str]:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
 # --- Template tests (Common Contract) ---
@@ -188,3 +196,71 @@ def test_rejects_movement_for_nonexistent_product_with_404(client):
 
     assert res.status_code == 404
     assert res.get_json()["error"] == "not_found"
+
+
+# --- Tests for Optional Extensions (/admin/stats and S3/R2 Persistence) ---
+
+def test_admin_stats_rejects_missing_or_wrong_credentials_with_401(client, monkeypatch):
+    monkeypatch.setenv("ADMIN_USER", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD", "secret123")
+
+    no_auth = client.get("/admin/stats")
+    assert no_auth.status_code == 401
+    assert no_auth.get_json()["error"] == "unauthorized"
+
+    wrong_auth = client.get("/admin/stats", headers=_basic_auth_header("admin", "wrong"))
+    assert wrong_auth.status_code == 401
+    assert wrong_auth.get_json()["error"] == "unauthorized"
+
+
+def test_admin_stats_rejects_when_env_not_configured(client, monkeypatch):
+    monkeypatch.delenv("ADMIN_USER", raising=False)
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+
+    res = client.get("/admin/stats", headers=_basic_auth_header("admin", "secret123"))
+    assert res.status_code == 401
+    assert res.get_json()["error"] == "unauthorized"
+
+
+def test_admin_stats_returns_stats_with_valid_credentials(client, monkeypatch):
+    monkeypatch.setenv("ADMIN_USER", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD", "secret123")
+
+    client.post("/products", json={"code": "ADM-01", "name": "Produs Admin", "initial_stock": 10})
+    res = client.get("/admin/stats", headers=_basic_auth_header("admin", "secret123"))
+
+    assert res.status_code == 200
+    assert res.get_json() == {
+        "total_products": 1,
+        "below_threshold": 1,
+        "total_stock": 10,
+    }
+
+
+def test_s3_persistence_save_and_load_roundtrip(client, monkeypatch):
+    saved_objects = {}
+
+    class DummyS3Client:
+        def put_object(self, Bucket, Key, Body, ContentType):
+            saved_objects[(Bucket, Key)] = Body
+
+        def get_object(self, Bucket, Key):
+            return {"Body": io.BytesIO(saved_objects[(Bucket, Key)])}
+
+    monkeypatch.setenv("S3_ENDPOINT", "https://example.r2.cloudflarestorage.com")
+    monkeypatch.setenv("S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("S3_ACCESS_KEY", "test-key")
+    monkeypatch.setenv("S3_SECRET_KEY", "test-secret")
+    monkeypatch.setattr(store, "_create_s3_client", lambda cfg: DummyS3Client())
+
+    client.post("/products", json={"code": "R2-01", "name": "Produs R2", "initial_stock": 20})
+    client.post("/movements", json={"product_id": 1, "type": "out", "quantity": 6})
+
+    # Simulate container restart by clearing memory and reloading from S3
+    store._init_memory()
+    assert store.products == {}
+
+    store.load_from_s3()
+    reloaded = client.get("/products/1")
+    assert reloaded.status_code == 200
+    assert reloaded.get_json()["current_stock"] == 14

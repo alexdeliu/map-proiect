@@ -53,7 +53,7 @@ python -m pytest --cov=src
 | `/products/{id}` | GET | Intoarce produsul si stocul curent |
 | `/movements` | POST | Inregistreaza o miscare de stoc in sau out |
 | `/stats` | GET | Ofera statistici despre stocul total si produsele sub prag |
-
+| `/admin/stats` | GET | Statistici globale protejate prin autentificare HTTP Basic |
 ## Decizii de implementare
 
 Pentru moment, datele sunt stocate in memorie folosind dictionare si liste in Python. Stocul curent nu este o valoare salvata, ci este calculat dinamic la fiecare interogare pe baza istoricului de miscari.
